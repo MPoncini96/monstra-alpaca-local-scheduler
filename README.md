@@ -13,12 +13,28 @@ logic, packaged to run continuously on Render.
 2. Reads your current Alpaca account positions and equity via the Alpaca
    Trading API.
 3. Computes the buy/sell orders needed to move your Alpaca account toward
-   those target weights.
-4. Logs the plan and — only when `DRY_RUN=false` — submits market orders.
+   those target weights — but only for symbols that have drifted from target
+   by `DRIFT_THRESHOLD` or more (or are a brand-new position, or a full exit
+   to zero), the same gating Monstra's own site-side Alpaca rebalancer uses.
+4. Logs the plan and — only when `DRY_RUN=false` — submits market orders:
+   all sells first, then buys, so buys are funded by sell proceeds.
 
 This runs once and exits (unlike the Schwab local package, Alpaca doesn't
 need an interactive browser login, so there's nothing to bootstrap — every
-run, scheduled or manual, works the same way).
+run, scheduled or manual, works the same way). It checks Alpaca's live
+market clock before trading and exits quietly if the market is closed, so
+it's safe to schedule for roughly when you want it to act without worrying
+about weekends or holidays.
+
+**Suggested schedule.** Monstra's own site-side Alpaca rebalancer checks
+signals twice a trading day, timed off the market session — once ~60–120
+minutes after the open, once ~60–120 minutes before the close. To mirror
+that here, set up two Task Scheduler/launchd/cron triggers roughly around
+market-open+90min and market-close−90min in US Eastern time (e.g. ~11:00 AM
+and ~2:30 PM ET for a normal 9:30 AM–4:00 PM session — convert to your
+machine's local time zone). The market-clock check means an imprecise
+trigger time is fine; it just won't do anything if the market happens to be
+closed.
 
 ## One-time setup
 
@@ -46,19 +62,23 @@ run, scheduled or manual, works the same way).
    ```
    (Open a new terminal afterward — `setx` only affects future processes.)
 2. Open **Task Scheduler** → **Create Basic Task…**
-3. Name it (e.g. "Monstra Alpaca Rebalance"), choose a trigger (e.g. Daily,
-   after market close).
+3. Name it (e.g. "Monstra Alpaca Rebalance AM"), set a Daily trigger around
+   your local-time equivalent of ~11:00 AM ET.
 4. Action: **Start a program**.
    - Program/script: full path to `python.exe` (find it with `where python`).
    - Add arguments: `main.py`
    - Start in: the folder containing `main.py`.
-5. Finish, run the task once manually, and check `alpaca_rebalance.log`
+5. Repeat steps 2–4 for a second task (e.g. "Monstra Alpaca Rebalance PM")
+   around your local-time equivalent of ~2:30 PM ET, to match the site's
+   twice-daily schedule.
+6. Finish, run each task once manually, and check `alpaca_rebalance.log`
    next to the script to confirm it worked.
 
-Command-line equivalent:
+Command-line equivalent (two tasks, adjust `/st` for your local time zone):
 
 ```
-schtasks /create /tn "Monstra Alpaca Rebalance" /tr "python C:\path\to\main.py" /sc daily /st 16:15
+schtasks /create /tn "Monstra Alpaca Rebalance AM" /tr "python C:\path\to\main.py" /sc daily /st 11:00
+schtasks /create /tn "Monstra Alpaca Rebalance PM" /tr "python C:\path\to\main.py" /sc daily /st 14:30
 ```
 
 ## macOS: launchd
@@ -85,23 +105,32 @@ Create `~/Library/LaunchAgents/bot.monstra.alpaca-rebalance.plist`:
     <key>ALPACA_PAPER_API_SECRET</key><string>your-alpaca-paper-secret</string>
   </dict>
   <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>16</integer>
-    <key>Minute</key><integer>15</integer>
-  </dict>
+  <array>
+    <dict>
+      <key>Hour</key><integer>11</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>14</integer>
+      <key>Minute</key><integer>30</integer>
+    </dict>
+  </array>
   <key>StandardOutPath</key><string>/tmp/monstra-alpaca-rebalance.log</string>
   <key>StandardErrorPath</key><string>/tmp/monstra-alpaca-rebalance.log</string>
 </dict>
 </plist>
 ```
 
-Load it with `launchctl load ~/Library/LaunchAgents/bot.monstra.alpaca-rebalance.plist`.
+(`StartCalendarInterval` as an array runs the job at each entry — here, your
+local-time equivalents of ~11:00 AM and ~2:30 PM ET; adjust for your time
+zone.) Load it with `launchctl load ~/Library/LaunchAgents/bot.monstra.alpaca-rebalance.plist`.
 
-Or, simpler, a crontab entry (`crontab -e`) — cron's environment is minimal,
-so export the variables in the line itself or a wrapper script:
+Or, simpler, two crontab entries (`crontab -e`) — cron's environment is
+minimal, so export the variables in the line itself or a wrapper script:
 
 ```
-15 16 * * 1-5 MONSTRA_API_KEY=... ALPACA_MODE=paper ALPACA_PAPER_API_KEY=... ALPACA_PAPER_API_SECRET=... /usr/bin/python3 /path/to/main.py >> /path/to/alpaca_rebalance.log 2>&1
+0 11 * * 1-5 MONSTRA_API_KEY=... ALPACA_MODE=paper ALPACA_PAPER_API_KEY=... ALPACA_PAPER_API_SECRET=... /usr/bin/python3 /path/to/main.py >> /path/to/alpaca_rebalance.log 2>&1
+30 14 * * 1-5 MONSTRA_API_KEY=... ALPACA_MODE=paper ALPACA_PAPER_API_KEY=... ALPACA_PAPER_API_SECRET=... /usr/bin/python3 /path/to/main.py >> /path/to/alpaca_rebalance.log 2>&1
 ```
 
 ## Config reference (env vars)
@@ -114,6 +143,9 @@ so export the variables in the line itself or a wrapper script:
 | `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_API_SECRET` | — | required when `ALPACA_MODE=live` |
 | `DRY_RUN` | `true` | log the plan only; set `false` to place real orders |
 | `MIN_TRADE_DOLLARS` | `25` | skip trades smaller than this |
+| `DRIFT_THRESHOLD` | `0.03` | only trade a symbol once it's this many percentage points off target (0.03 = 3%); new/full-exit positions always trade |
+| `SELL_FILL_TIMEOUT_SECONDS` | `60` | how long to wait for sells to fill before submitting buys |
+| `SKIP_MARKET_CLOSED_CHECK` | `false` | set `true` to trade even when Alpaca's clock says the market is closed |
 
 ## Safety
 
@@ -131,5 +163,10 @@ so export the variables in the line itself or a wrapper script:
   and `DRY_RUN=false`.** Run it in paper mode first and check
   `alpaca_rebalance.log` after several scheduled runs before considering
   live mode.
+- Worth knowing: Monstra's own site-side Alpaca auto-rebalancer explicitly
+  refuses to run automatically on live-mode connections at all — scheduled/
+  unattended execution there is paper-only. This script does *not* enforce
+  that same restriction, so the safety margin here is entirely up to how you
+  configure it.
 - Treat your Monstra API key and Alpaca keys like passwords — don't commit
   them to source control.

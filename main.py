@@ -8,13 +8,23 @@ What this does:
   2. Reads your current Alpaca account positions and equity via the Alpaca
      Trading API.
   3. Computes the buy/sell orders needed to move your Alpaca account toward
-     the Monstra target weights.
-  4. Logs the plan and -- only when DRY_RUN=false -- submits market orders.
+     the Monstra target weights -- but only for symbols that have drifted
+     from target by more than DRIFT_THRESHOLD (or are a brand-new position /
+     a full exit to zero), the same gating Monstra's own site-side Alpaca
+     rebalancer uses.
+  4. Logs the plan and -- only when DRY_RUN=false -- submits market orders:
+     all sells first, then buys, so buys are funded by sell proceeds.
 
 This runs once and exits. Run it on a schedule using Windows Task Scheduler,
-macOS launchd, or cron -- see README.md. If you'd rather not manage your own
-scheduler, see the sibling package `monstra-alpaca-render-worker`, which runs
-the same logic continuously as an always-on Render Background Worker.
+macOS launchd, or cron -- see README.md. Each run checks Alpaca's live market
+clock before trading and exits quietly if the market is closed, so it's safe
+to schedule it for roughly when you want it to act (e.g. twice a day, mid-
+morning and mid-afternoon) without worrying about weekends or holidays.
+
+If you'd rather not manage your own scheduler, see the sibling package
+`monstra-alpaca-render-worker`, which runs the same logic continuously as an
+always-on Render Background Worker and works out its own twice-daily timing
+from the market calendar.
 
 Setup:
   1. Get a Monstra API key at https://www.monstra.bot/dashboard/api and set
@@ -36,7 +46,9 @@ Safety:
   - Orders are whole-share MARKET/DAY orders only.
   - Sells are capped at your current share count -- this script never opens
     a short position.
-  - Trades below MIN_TRADE_DOLLARS are skipped to avoid dust orders.
+  - A symbol only trades if it has drifted from target by DRIFT_THRESHOLD or
+    more (default 3 percentage points), or is a brand-new target position or
+    a full exit -- and still has to clear MIN_TRADE_DOLLARS.
 
 This script places real trades with real money once ALPACA_MODE=live and
 DRY_RUN=false. Review the README and the logged plan carefully.
@@ -47,6 +59,7 @@ import logging
 import math
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -74,6 +87,9 @@ ALPACA_DATA_BASE = "https://data.alpaca.markets"
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() not in ("false", "0", "no")
 MIN_TRADE_DOLLARS = float(os.environ.get("MIN_TRADE_DOLLARS", "25"))
+DRIFT_THRESHOLD = float(os.environ.get("DRIFT_THRESHOLD", "0.03"))  # 3 percentage points, matches the site
+SELL_FILL_TIMEOUT_SECONDS = int(os.environ.get("SELL_FILL_TIMEOUT_SECONDS", "60"))
+SKIP_MARKET_CLOSED_CHECK = os.environ.get("SKIP_MARKET_CLOSED_CHECK", "false").strip().lower() in ("true", "1", "yes")
 LOG_FILE_PATH = Path(os.environ.get("ALPACA_LOG_FILE_PATH", str(Path(__file__).with_name("alpaca_rebalance.log"))))
 
 logging.basicConfig(
@@ -140,8 +156,16 @@ def fetch_monstra_holdings():
 
 
 # ------------------------------------------------------------------
-# 4. Alpaca: account, positions, prices, orders
+# 4. Alpaca: market clock, account, positions, prices, orders
 # ------------------------------------------------------------------
+
+
+def is_market_open_now():
+    status, payload = _alpaca("GET", f"{ALPACA_TRADING_BASE}/v2/clock")
+    if status != 200:
+        log.warning("Could not read Alpaca market clock (%s): %s", status, payload)
+        return False
+    return bool((payload or {}).get("is_open"))
 
 
 def get_account_snapshot():
@@ -183,11 +207,14 @@ def build_trade_plan(holdings, total_value, positions, prices):
             log.info("  skipping %s: no live price available", symbol)
             continue
 
-        target_dollars = holdings.get(symbol, 0.0) * total_value
+        target_pct = holdings.get(symbol, 0.0)
+        target_dollars = target_pct * total_value
         target_shares = math.floor(target_dollars / price)
         current_shares = int(positions.get(symbol, 0))
-        delta_shares = target_shares - current_shares
+        current_pct = (current_shares * price / total_value) if total_value else 0.0
+        drift_pct = abs(current_pct - target_pct)
 
+        delta_shares = target_shares - current_shares
         if delta_shares > 0:
             side, quantity = "buy", delta_shares
         elif delta_shares < 0:
@@ -195,9 +222,20 @@ def build_trade_plan(holdings, total_value, positions, prices):
             side, quantity = "sell", min(-delta_shares, current_shares)
         else:
             continue
-
-        if quantity <= 0 or quantity * price < MIN_TRADE_DOLLARS:
+        if quantity <= 0:
             continue
+
+        # Brand-new target positions and full exits to zero always trade,
+        # bypassing both the drift threshold and the dollar floor -- same as
+        # evaluateRebalanceDriftGate() on the site.
+        is_new_position = side == "buy" and current_shares <= 0 and target_pct > 0
+        is_full_exit = side == "sell" and current_shares > 0 and target_pct <= 0
+
+        if not (is_new_position or is_full_exit):
+            if drift_pct < DRIFT_THRESHOLD:
+                continue
+            if quantity * price < MIN_TRADE_DOLLARS:
+                continue
 
         plan.append(
             {
@@ -207,6 +245,7 @@ def build_trade_plan(holdings, total_value, positions, prices):
                 "price": price,
                 "current_shares": current_shares,
                 "target_shares": target_shares,
+                "drift_pct": drift_pct,
             }
         )
     return plan
@@ -223,8 +262,19 @@ def place_order(trade):
     status, payload = _alpaca("POST", f"{ALPACA_TRADING_BASE}/v2/orders", data=order)
     if status not in (200, 201):
         log.error("  FAILED %s %s %s: (%s) %s", trade["side"], trade["quantity"], trade["symbol"], status, payload)
-    else:
-        log.info("  submitted %s %s %s", trade["side"], trade["quantity"], trade["symbol"])
+        return None
+    log.info("  submitted %s %s %s", trade["side"], trade["quantity"], trade["symbol"])
+    return (payload or {}).get("id")
+
+
+def wait_for_fill(order_id, timeout_seconds=SELL_FILL_TIMEOUT_SECONDS, poll_interval=5):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        status, payload = _alpaca("GET", f"{ALPACA_TRADING_BASE}/v2/orders/{order_id}")
+        if status == 200 and (payload or {}).get("status") == "filled":
+            return True
+        time.sleep(poll_interval)
+    return False
 
 
 # ------------------------------------------------------------------
@@ -238,35 +288,53 @@ def main():
     if "PASTE_YOUR" in ALPACA_API_KEY or "PASTE_YOUR" in ALPACA_API_SECRET:
         sys.exit(f"Alpaca API key/secret for mode={ALPACA_MODE} not set.")
 
+    if not SKIP_MARKET_CLOSED_CHECK and not is_market_open_now():
+        log.info("Alpaca market is currently closed -- skipping this run.")
+        return
+
     holdings = fetch_monstra_holdings()
     total_value, positions = get_account_snapshot()
     prices = get_last_prices(set(holdings) | set(positions))
 
     plan = build_trade_plan(holdings, total_value, positions, prices)
     if not plan:
-        log.info("Account already matches target weights (within MIN_TRADE_DOLLARS). Nothing to do.")
+        log.info("No symbol has drifted %.0f%% or more from target (and no new/exit positions). Nothing to do.", DRIFT_THRESHOLD * 100)
         return
 
     log.info("Account value: $%.2f", total_value)
     log.info("Proposed trades:")
     for trade in plan:
         log.info(
-            "  %-4s %6d %-8s @ ~$%.2f  (%s -> %s shares)",
+            "  %-4s %6d %-8s @ ~$%.2f  (%s -> %s shares, drift %.1f%%)",
             trade["side"],
             trade["quantity"],
             trade["symbol"],
             trade["price"],
             trade["current_shares"],
             trade["target_shares"],
+            trade["drift_pct"] * 100,
         )
 
     if DRY_RUN:
         log.info("DRY_RUN is true -- no orders sent. Set DRY_RUN=false to enable live trading.")
         return
 
-    log.info("Submitting orders...")
-    for trade in plan:
-        place_order(trade)
+    sells = [t for t in plan if t["side"] == "sell"]
+    buys = [t for t in plan if t["side"] == "buy"]
+
+    if sells:
+        log.info("Submitting sell orders...")
+        sell_order_ids = [order_id for order_id in (place_order(t) for t in sells) if order_id]
+        if sell_order_ids:
+            log.info("Waiting up to %ss for sell orders to fill before buying...", SELL_FILL_TIMEOUT_SECONDS)
+            for order_id in sell_order_ids:
+                if not wait_for_fill(order_id):
+                    log.warning("  order %s did not confirm filled within timeout; proceeding anyway", order_id)
+
+    if buys:
+        log.info("Submitting buy orders...")
+        for trade in buys:
+            place_order(trade)
 
 
 if __name__ == "__main__":
